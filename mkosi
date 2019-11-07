@@ -85,6 +85,9 @@ def die(message: str, status: int = 1) -> NoReturn:
 def warn(message: str, *args: Any, **kwargs: Any) -> None:
     sys.stderr.write('WARNING: ' + message.format(*args, **kwargs) + '\n')
 
+def tmp_dir() -> str:
+    return os.environ.get('TMPDIR') or '/var/tmp'
+
 
 class CommandLineArguments(argparse.Namespace):
     """Type-hinted storage for command line arguments."""
@@ -98,6 +101,7 @@ class SourceFileTransfer(enum.Enum):
     copy_all = "copy-all"
     copy_git_cached = "copy-git-cached"
     copy_git_others = "copy-git-others"
+    copy_git_more = "copy-git-more"
     mount = "mount"
 
     def __str__(self):
@@ -108,6 +112,7 @@ class SourceFileTransfer(enum.Enum):
         return {cls.copy_all: "normal file copy",
                 cls.copy_git_cached: "use git-ls-files --cached, ignoring any file that git itself ignores",
                 cls.copy_git_others: "use git-ls-files --others, ignoring any file that git itself ignores",
+                cls.copy_git_more: "use git-ls-files --cached, ignoring any file that git itself ignores, but include the .git/ directory",
                 cls.mount: "bind mount source files into the build image"}
 
 
@@ -169,7 +174,9 @@ class Distribution(enum.Enum):
     opensuse = 5
     mageia = 6
     centos = 7
-    clear = 8
+    centos_epel = 8
+    clear = 9
+    photon = 10
 
 
 GPT_ROOT_X86           = uuid.UUID("44479540f29741b29af7d131d5f0458a")  # NOQA: E221
@@ -209,6 +216,7 @@ FEDORA_KEYS_MAP = {
     '28': '9DB62FB1',
     '29': '429476B4',
     '30': 'CFC659B9',
+    '31': '3C3359C4',
 }
 
 # 1 MB at the beginning of the disk for the GPT disk label, and
@@ -216,6 +224,15 @@ FEDORA_KEYS_MAP = {
 GPT_HEADER_SIZE = 1024*1024
 GPT_FOOTER_SIZE = 1024*1024
 
+
+# Debian calls their architectures differently, so when calling debbootstrap we
+# will have to map to their names
+DEBIAN_ARCHITECTURES = {
+    'x86_64': 'amd64',
+    'x86': 'i386',
+    'aarch64': 'arm64',
+    'armhfp': 'armhf',
+}
 
 class GPTRootTypePair(NamedTuple):
     root: uuid.UUID
@@ -429,7 +446,7 @@ def setup_workspace(args: CommandLineArguments) -> tempfile.TemporaryDirectory:
     if args.output_format in (OutputFormat.directory, OutputFormat.subvolume):
         d = tempfile.TemporaryDirectory(dir=os.path.dirname(args.output), prefix='.mkosi-')
     else:
-        d = tempfile.TemporaryDirectory(dir='/var/tmp', prefix='mkosi-')
+        d = tempfile.TemporaryDirectory(dir=tmp_dir(), prefix='mkosi-')
 
     print_step("Temporary workspace in " + d.name + " is now set up.")
     return d
@@ -1023,7 +1040,7 @@ def mount_cache(args: CommandLineArguments, workspace: str) -> Generator[None, N
     with complete_step('Mounting Package Cache'):
         if args.distribution in (Distribution.fedora, Distribution.mageia):
             mount_bind(args.cache_path, os.path.join(workspace, "root", "var/cache/dnf"))
-        elif args.distribution == Distribution.centos:
+        elif args.distribution in (Distribution.centos, Distribution.centos_epel):
             # We mount both the YUM and the DNF cache in this case, as
             # YUM might just be redirected to DNF even if we invoke
             # the former
@@ -1035,6 +1052,8 @@ def mount_cache(args: CommandLineArguments, workspace: str) -> Generator[None, N
             mount_bind(args.cache_path, os.path.join(workspace, "root", "var/cache/pacman/pkg"))
         elif args.distribution == Distribution.opensuse:
             mount_bind(args.cache_path, os.path.join(workspace, "root", "var/cache/zypp/packages"))
+        elif args.distribution == Distribution.photon:
+            mount_bind(os.path.join(args.cache_path, "tdnf"), os.path.join(workspace, "root", "var/cache/tdnf"))
     try:
         yield
     finally:
@@ -1312,8 +1331,18 @@ def clean_package_manager_metadata(workspace: str) -> None:
     clean_dnf_metadata(root)
     clean_yum_metadata(root)
     clean_rpm_metadata(root)
+    clean_tdnf_metadata(root)
     # FIXME: implement cleanup for other package managers
 
+def clean_tdnf_metadata(root: str) -> None:
+	    """Removes tdnf metadata iff /bin/tdnf is not present in the image"""
+	    tdnf_path = root + '/usr/bin/tdnf'
+	    keep_tdnf_data = os.access(tdnf_path, os.F_OK, follow_symlinks=False)
+
+	    if not keep_tdnf_data:
+	        print_step('Cleaning tdnf metadata...')
+	        remove_glob(root + '/var/log/tdnf.*',
+	                    root + '/var/cache/tdnf')
 
 def invoke_dnf(args: CommandLineArguments,
                workspace: str,
@@ -1347,6 +1376,83 @@ def invoke_dnf(args: CommandLineArguments,
 
     with mount_api_vfs(args, workspace):
         run(cmdline, check=True)
+
+def invoke_tdnf(args: CommandLineArguments,
+	            workspace: str,
+	            root: str,
+	            repositories: List[str],
+	            packages: List[str],
+	            config_file: str) -> None:
+	repos = ["--enablerepo=" + repo for repo in repositories]
+
+	packages = make_rpm_list(args, packages)
+
+	cmdline = ["tdnf",
+	           "-y",
+	           "--config=" + config_file,
+	           "--releasever=" + args.release,
+	           "--installroot=" + root,
+	           "--disablerepo=*",
+	           *repos
+    ]
+
+	cmdline += ['install', *packages]
+
+	with mount_api_vfs(args, workspace):
+	    run(cmdline, check=True)
+
+@completestep('Installing Photon')
+def install_photon(args: CommandLineArguments, workspace: str, do_run_build_script: bool) -> None:
+    masked = disable_kernel_install(args, workspace)
+
+    gpg_key = '/etc/pki/rpm-gpg/VMWARE-RPM-GPG-KEY'
+    gpg_key_string = f'file://{gpg_key}'
+    root = os.path.join(workspace, "root")
+
+    if os.path.exists(gpg_key):
+	    gpgcheck = "gpgcheck=1"
+	    cmdline = ["rpm", "--import", gpg_key, "--root", root]
+	    run(cmdline, check=True)
+
+    else:
+	    gpgcheck = "gpgcheck=0"
+
+    release_url = "https://dl.bintray.com/vmware/photon_release_$releasever_$basearch"
+    updates_url = "https://dl.bintray.com/vmware/photon_updates_$releasever_$basearch"
+
+    config_file = os.path.join(workspace, "tdnf.conf")
+    repo_file = os.path.join(workspace, "temp.repo")
+    with open(config_file, "w") as f:
+	        f.write(f"""\
+[main]
+{gpgcheck}
+repodir={workspace}
+""")
+
+    with open(repo_file, "w") as f:
+	    f.write(f"""\
+[photon]
+name=VMware Photon OS {args.release} Release
+baseurl={release_url}
+enabled=1
+gpgkey={gpg_key_string}
+
+[photon-updates]
+name=VMware Photon OS {args.release} Updates
+baseurl={updates_url}
+enabled=1
+gpgkey={gpg_key_string}
+""")
+
+    packages = ["minimal"]
+    if args.bootable:
+	    packages += ["linux", "initramfs"]
+
+    invoke_tdnf(args, workspace, root,
+	                args.repositories if args.repositories else ["photon", "photon-updates"],
+	                packages,
+	                config_file)
+    reenable_kernel_install(args, workspace, masked)
 
 
 @completestep('Installing Clear Linux')
@@ -1564,18 +1670,32 @@ def invoke_dnf_or_yum(args: CommandLineArguments,
 def install_centos(args: CommandLineArguments, workspace: str, do_run_build_script: bool) -> None:
     masked = disable_kernel_install(args, workspace)
 
+    epel_release = args.release.split('.')[0]
     gpg_key = f"/etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-{args.release}"
+    epel_gpg_key = f"/etc/pki/rpm-gpg/RPM-GPG-KEY-EPEL-{epel_release}"
+
     if os.path.exists(gpg_key):
         gpg_key = f'file://{gpg_key}'
     else:
         gpg_key = f'https://www.centos.org/keys/RPM-GPG-KEY-CentOS-{args.release}'
 
+    if os.path.exists(epel_gpg_key):
+        epel_gpg_key = f'file://{epel_gpg_key}'
+    else:
+        epel_gpg_key = f'https://dl.fedoraproject.org/pub/epel/RPM-GPG-KEY-EPEL-{epel_release}'
+
     if args.mirror:
         release_url = f"baseurl={args.mirror}/centos/{args.release}/os/x86_64"
         updates_url = f"baseurl={args.mirror}/centos/{args.release}/updates/x86_64/"
+        extras_url = f"baseurl={args.mirror}/centos/{args.release}/extras/x86_64/"
+        centosplus_url = f"baseurl={args.mirror}/centos/{args.release}/centosplus/x86_64/"
+        epel_url = f"baseurl={args.mirror}/epel/{epel_release}/x86_64/"
     else:
         release_url = f"mirrorlist=http://mirrorlist.centos.org/?release={args.release}&arch=x86_64&repo=os"
         updates_url = f"mirrorlist=http://mirrorlist.centos.org/?release={args.release}&arch=x86_64&repo=updates"
+        extras_url = f"mirrorlist=http://mirrorlist.centos.org/?release={args.release}&arch=x86_64&repo=extras"
+        centosplus_url = f"mirrorlist=http://mirrorlist.centos.org/?release={args.release}&arch=x86_64&repo=centosplus"
+        epel_url = f"baseurl=http://download.fedoraproject.org/pub/epel/{epel_release}/x86_64"
 
     config_file = os.path.join(workspace, "yum.conf")
     with open(config_file, "w") as f:
@@ -1592,14 +1712,39 @@ gpgkey={gpg_key}
 name=CentOS-{args.release} - Updates
 {updates_url}
 gpgkey={gpg_key}
+
+[extras]
+name=CentOS-{args.release} - Extras
+{extras_url}
+gpgkey={gpg_key}
+
+[centosplus]
+name=CentOS-{args.release} - Plus
+{centosplus_url}
+gpgkey={gpg_key}
+""")
+        if args.distribution == Distribution.centos_epel:
+            f.write(f"""\
+
+[epel]
+name=Extra Packages for Enterprise Linux 7 - $basearch
+{epel_url}
+gpgkey={epel_gpg_key}
+
 """)
 
     packages = ['centos-release']
     packages += args.packages or []
     if args.bootable:
         packages += ["kernel", "systemd-udev", "binutils"]
+
+    repos = args.repositories or ["base", "updates", "extras", "centosplus"]
+    if args.distribution == Distribution.centos_epel:
+        repos += ["epel"]
+        packages += ["epel-release"]
+
     invoke_dnf_or_yum(args, workspace,
-                      args.repositories or ["base", "updates"],
+                      repos,
                       packages,
                       config_file)
 
@@ -1625,6 +1770,10 @@ def install_debian_or_ubuntu(args: CommandLineArguments,
                "--include=systemd-sysv",
                "--exclude=sysv-rc,initscripts,startpar,lsb-base,insserv",
                "--components=" + ','.join(repos)]
+
+    if args.architecture is not None:
+        debarch = DEBIAN_ARCHITECTURES.get(args.architecture)
+        cmdline += [f"--arch={debarch}"]
 
     # Let's use --merged-usr and --no-check-valid-until only if debootstrap knows it
     for arg in ["--merged-usr", "--no-check-valid-until"]:
@@ -1920,8 +2069,8 @@ def install_opensuse(args: CommandLineArguments, workspace: str, do_run_build_sc
     # here to make sure that the package cache stays populated after
     # "zypper install".
     #
-    run(["zypper", "--root", root, "addrepo", "-ck", release_url, "Main"], check=True)
-    run(["zypper", "--root", root, "addrepo", "-ck", updates_url, "Updates"], check=True)
+    run(["zypper", "--root", root, "addrepo", "-ck", release_url, "repo-oss"], check=True)
+    run(["zypper", "--root", root, "addrepo", "-ck", updates_url, "repo-update"], check=True)
 
     if not args.with_docs:
         with open(os.path.join(root, "etc/zypp/zypp.conf"), "w") as f:
@@ -1933,10 +2082,11 @@ def install_opensuse(args: CommandLineArguments, workspace: str, do_run_build_sc
     #
     # Install the "minimal" package set.
     #
-    if release.startswith("42."):
-        run(cmdline + ["patterns-openSUSE-minimal_base"], check=True)
-    else:
-        run(cmdline + ["patterns-base-minimal_base"], check=True)
+    with mount_api_vfs(args, workspace):
+        if release.startswith("42."):
+            run(cmdline + ["patterns-openSUSE-minimal_base"], check=True)
+        else:
+            run(cmdline + ["patterns-base-minimal_base"], check=True)
 
 
     #
@@ -1959,14 +2109,15 @@ def install_opensuse(args: CommandLineArguments, workspace: str, do_run_build_sc
         extra_packages.extend(args.build_packages)
 
     if extra_packages:
-        run(cmdline + extra_packages, check=True)
+        with mount_api_vfs(args, workspace):
+            run(cmdline + extra_packages, check=True)
 
     #
     # Disable packages caching in the image that was enabled
     # previously to populate the package cache.
     #
-    run(["zypper", "--root", root, "modifyrepo", "-K", "Main"], check=True)
-    run(["zypper", "--root", root, "modifyrepo", "-K", "Updates"], check=True)
+    run(["zypper", "--root", root, "modifyrepo", "-K", "repo-oss"], check=True)
+    run(["zypper", "--root", root, "modifyrepo", "-K", "repo-update"], check=True)
 
     #
     # Tune dracut confs: openSUSE uses an old version of dracut that's
@@ -1994,12 +2145,14 @@ def install_distribution(args: CommandLineArguments,
     install: Dict[Distribution, Callable[[CommandLineArguments, str, bool], None]] = {
         Distribution.fedora: install_fedora,
         Distribution.centos: install_centos,
+        Distribution.centos_epel: install_centos,
         Distribution.mageia: install_mageia,
         Distribution.debian: install_debian,
         Distribution.ubuntu: install_ubuntu,
         Distribution.arch: install_arch,
         Distribution.opensuse: install_opensuse,
         Distribution.clear: install_clear,
+        Distribution.photon: install_photon,
     }
 
     install[args.distribution](args, workspace, do_run_build_script)
@@ -2062,7 +2215,10 @@ def set_root_password(args: CommandLineArguments, workspace: str, do_run_build_s
             patch_file(os.path.join(workspace, 'root', 'etc/passwd'), jj)
     elif args.password:
         with complete_step("Setting root password"):
-            password = crypt.crypt(args.password, crypt.mksalt(crypt.METHOD_SHA512))
+            if args.password_is_hashed:
+                password = args.password
+            else:
+                password = crypt.crypt(args.password, crypt.mksalt(crypt.METHOD_SHA512))
 
             def jj(line: str) -> str:
                 if line.startswith('root:'):
@@ -2212,6 +2368,10 @@ def install_boot_loader_clear(args: CommandLineArguments, workspace: str, loopde
     run_workspace_command(args, workspace, "/usr/bin/clr-boot-manager", "update", "-i", nspawn_params=nspawn_params)
 
 
+def install_boot_loader_photon(args: CommandLineArguments, workspace: str, loopdev: str) -> None:
+	    install_grub(args, workspace, loopdev, "grub2")
+
+
 def install_boot_loader(args: CommandLineArguments, workspace: str, loopdev: Optional[str], cached: bool) -> None:
     if not args.bootable:
         return
@@ -2246,6 +2406,8 @@ def install_boot_loader(args: CommandLineArguments, workspace: str, loopdev: Opt
         if args.distribution == Distribution.clear:
             install_boot_loader_clear(args, workspace, loopdev)
 
+        if args.distribution == Distribution.photon:
+            install_boot_loader_photon(args, workspace, loopdev)
 
 def install_extra_trees(args: CommandLineArguments, workspace: str, for_cache: bool) -> None:
     if not args.extra_trees:
@@ -2284,6 +2446,16 @@ def copy_git_files(src: str, dest: str, *, source_file_transfer: SourceFileTrans
             universal_newlines=False,
             check=True)
     files = {x.decode("utf-8") for x in c.stdout.rstrip(b'\0').split(b'\0')}
+
+    # Add the .git/ directory in as well.
+    if source_file_transfer == SourceFileTransfer.copy_git_more:
+        # r=root, d=directories, f=files
+        top = os.path.join(src, ".git/")
+        for r, d, f in os.walk(top):
+            for fh in f:
+                fp = os.path.join(r, fh) # full path
+                fr = os.path.join(".git/", fp[len(top):]) # relative to top
+                files.add(fr)
 
     # Get submodule files
     c = run(['git', '-C', src, 'submodule', 'status', '--recursive'],
@@ -2336,7 +2508,7 @@ def install_build_src(args: CommandLineArguments, workspace: str, do_run_build_s
             if source_file_transfer is None and (os.path.exists('.git') or os.path.exists(os.path.join(args.build_sources, '.git'))):
                 source_file_transfer = SourceFileTransfer.copy_git_cached
 
-            if source_file_transfer in (SourceFileTransfer.copy_git_others, SourceFileTransfer.copy_git_cached):
+            if source_file_transfer in (SourceFileTransfer.copy_git_others, SourceFileTransfer.copy_git_cached, SourceFileTransfer.copy_git_more):
                 copy_git_files(args.build_sources, target, source_file_transfer=source_file_transfer)
             elif source_file_transfer == SourceFileTransfer.copy_all:
                 ignore = shutil.ignore_patterns('.git',
@@ -3229,6 +3401,7 @@ def create_parser() -> ArgumentParserMkosi:
     group.add_argument("--build-directory", dest='build_dir', help='Path to use as persistent build directory', metavar='PATH')
     group.add_argument("--build-package", action=CommaDelimitedListAction, dest='build_packages', default=[],
                        help='Additional packages needed for build script', metavar='PACKAGE')
+    group.add_argument("--skip-final-phase", action=BooleanAction, help='Skip the (second) final image building phase.', default=False)
     group.add_argument("--postinst-script", help='Postinstall script to run inside image', metavar='PATH')
     group.add_argument("--finalize-script", help='Postinstall script to run outside image', metavar='PATH')
     group.add_argument("--source-file-transfer", type=SourceFileTransfer, choices=list(SourceFileTransfer), default=None,
@@ -3259,6 +3432,8 @@ def create_parser() -> ArgumentParserMkosi:
     group.add_argument("--bmap", action=BooleanAction,
                        help='Write block map file (.bmap) for bmaptool usage (only gpt_ext4, gpt_btrfs)')
     group.add_argument("--password", help='Set the root password')
+    group.add_argument("--password-is-hashed", action=BooleanAction,
+                       help='Indicate that the root password has already been hashed')
 
     group = parser.add_argument_group("Host configuration")
     group.add_argument("--extra-search-path", dest='extra_search_paths', action=ColonDelimitedListAction, default=[],
@@ -3296,7 +3471,7 @@ def parse_args(argv=None) -> Dict[str, CommandLineArguments]:
     """
     parser = create_parser()
 
-    # always work on a copy, argv will be altered which might has some side effects e.g. in unit tests. 
+    # always work on a copy, argv will be altered which might has some side effects e.g. in unit tests.
     if argv is None:
         argv = copy.deepcopy(sys.argv[1:])
     else:
@@ -3449,14 +3624,16 @@ def detect_distribution() -> Tuple[Optional[Distribution], Optional[str]]:
 
     for ln in f:
         if ln.startswith("ID="):
-            dist_id = ln[3:].strip()
+            dist_id = ln[3:].strip(' \t\n"\'')
+        if ln.startswith("ID_LIKE="):
+            dist_id_like = ln[8:].strip(' \t\n"\'').split()
         if ln.startswith("VERSION_ID="):
-            version_id = ln[11:].strip()
+            version_id = ln[11:].strip(' \t\n"\'')
         if ln.startswith("VERSION_CODENAME="):
-            version_codename = ln[17:].strip()
+            version_codename = ln[17:].strip(' \t\n"\'')
         if ln.startswith("VERSION="):
             # extract Debian release codename
-            version_str = ln[8:].strip()
+            version_str = ln[8:].strip(' \t\n"\'')
             debian_codename_re = r'\((.*?)\)'
 
             codename_list = re.findall(debian_codename_re, version_str)
@@ -3469,6 +3646,11 @@ def detect_distribution() -> Tuple[Optional[Distribution], Optional[str]]:
     d: Optional[Distribution] = None
     if dist_id is not None:
         d = Distribution.__members__.get(dist_id, None)
+        if d is None:
+            for dist_id in dist_id_like:
+                d = Distribution.__members__.get(dist_id, None)
+                if d is not None:
+                    break
 
     if d == Distribution.debian and (version_codename or extracted_codename):
         # debootstrap needs release codenames, not version numbers
@@ -3761,7 +3943,7 @@ def load_args(args: CommandLineArguments) -> CommandLineArguments:
     if args.release is None:
         if args.distribution == Distribution.fedora:
             args.release = "29"
-        elif args.distribution == Distribution.centos:
+        elif args.distribution in (Distribution.centos, Distribution.centos_epel):
             args.release = "7"
         elif args.distribution == Distribution.mageia:
             args.release = "6"
@@ -3773,6 +3955,8 @@ def load_args(args: CommandLineArguments) -> CommandLineArguments:
             args.release = "tumbleweed"
         elif args.distribution == Distribution.clear:
             args.release = "latest"
+        elif args.release == Distribution.photon:
+            args.release = "3.0"
 
     find_cache(args)
 
@@ -3798,13 +3982,21 @@ def load_args(args: CommandLineArguments) -> CommandLineArguments:
 
         if not args.boot_protocols:
             args.boot_protocols = ["uefi"]
+
+            if args.distribution == Distribution.photon:
+                args.boot_protocols = ["bios"]
+
         if not {"uefi", "bios"}.issuperset(args.boot_protocols):
             die("Not a valid boot protocol")
         if "bios" in args.boot_protocols and args.distribution not in (Distribution.fedora,
                                                                        Distribution.arch,
                                                                        Distribution.debian,
-                                                                       Distribution.ubuntu):
+                                                                       Distribution.ubuntu,
+                                                                       Distribution.photon):
             die(f"bios boot not implemented yet for {args.distribution}")
+
+            if "uefi" in args.boot_protocols and args.distribution == Distribution.photon:
+	            die(f"uefi boot not supported for {args.distribution}")
 
     if args.encrypt is not None:
         if not args.output_format.is_disk():
@@ -4058,7 +4250,7 @@ def print_summary(args: CommandLineArguments) -> None:
     sys.stderr.write("\nPACKAGES:\n")
     sys.stderr.write("              Packages: " + line_join_list(args.packages) + "\n")
 
-    if args.distribution in (Distribution.fedora, Distribution.centos, Distribution.mageia):
+    if args.distribution in (Distribution.fedora, Distribution.centos, Distribution.centos_epel, Distribution.mageia):
         sys.stderr.write("    With Documentation: " + yes_no(args.with_docs) + "\n")
 
     sys.stderr.write("         Package Cache: " + none_to_none(args.cache_path) + "\n")
@@ -4073,6 +4265,7 @@ def print_summary(args: CommandLineArguments) -> None:
     sys.stderr.write("  Source File Transfer: " + none_to_none(args.source_file_transfer) + "\n")
     sys.stderr.write("       Build Directory: " + none_to_none(args.build_dir) + "\n")
     sys.stderr.write("        Build Packages: " + line_join_list(args.build_packages) + "\n")
+    sys.stderr.write("      Skip final phase: " + yes_no(args.skip_final_phase) + "\n")
     sys.stderr.write("    Postinstall Script: " + none_to_none(args.postinst_script) + "\n")
     sys.stderr.write("       Finalize Script: " + none_to_none(args.finalize_script) + "\n")
     sys.stderr.write("  Scripts with network: " + yes_no(args.with_network) + "\n")
@@ -4258,6 +4451,7 @@ def run_build_script(args: CommandLineArguments, workspace: str, raw: Optional[B
                    "--setenv=WITH_DOCS=" + one_zero(args.with_docs),
                    "--setenv=WITH_TESTS=" + one_zero(args.with_tests),
                    "--setenv=WITH_NETWORK=" + one_zero(args.with_network),
+                   "--setenv=MKOSI_DEFAULT=" + args.default_path,
                    "--setenv=DESTDIR=/root/dest"]
 
         if args.build_sources is not None:
@@ -4363,7 +4557,7 @@ def build_stuff(args: CommandLineArguments) -> None:
     run_finalize_script(args, workspace.name, verb='build')
 
     if args.build_script:
-        # Run the image builder for the first (develpoment) stage in preparation for the build script
+        # Run the image builder for the first (development) stage in preparation for the build script
         raw, tar, root_hash = build_image(args, workspace, do_run_build_script=True)
 
         run_build_script(args, workspace.name, raw)
@@ -4372,7 +4566,11 @@ def build_stuff(args: CommandLineArguments) -> None:
     run_finalize_script(args, workspace.name, verb='final')
 
     # Run the image builder for the second (final) stage
-    raw, tar, root_hash = build_image(args, workspace, do_run_build_script=False, cleanup=True)
+    if args.skip_final_phase:
+        print_step('Skipping (second) final image build phase.')
+        raw, tar, root_hash = None, None, None
+    else:
+        raw, tar, root_hash = build_image(args, workspace, do_run_build_script=False, cleanup=True)
 
     raw = qcow2_output(args, raw)
     raw = xz_output(args, raw)
@@ -4482,6 +4680,7 @@ def run_qemu(args: CommandLineArguments) -> None:
                 "-m", "1024",
                 "-drive", "if=pflash,format=raw,readonly,file=" + firmware,
                 "-drive", "format=" + ("qcow2" if args.qcow2 else "raw") + ",file=" + args.output,
+                "-object", "rng-random,filename=/dev/urandom,id=rng0", "-device", "virtio-rng-pci,rng=rng0,id=rng-device0",
                 *args.cmdline]
 
     print_running_cmd(cmdline)
@@ -4564,8 +4763,8 @@ def main() -> None:
 
     for job_name, a in args.items():
         # Change working directory if --directory is passed
-        if hasattr(args, 'directory'):
-            work_dir = args.directory
+        if a.directory:
+            work_dir = a.directory
             if os.path.isdir(work_dir):
                 os.chdir(work_dir)
             else:

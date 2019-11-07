@@ -4,7 +4,7 @@
 
 # NAME
 
-mkosi — Build Legacy-Free OS Images
+mkosi - Build Legacy-Free OS Images
 
 # SYNOPSIS
 
@@ -156,7 +156,7 @@ details see the table below.
 `--distribution=`, `-d`
 : The distribution to install in the image. Takes one of the following
   arguments: `fedora`, `debian`, `ubuntu`, `arch`, `opensuse`,
-  `mageia`, `centos`, `clear`. If not specified, defaults to the
+  `mageia`, `centos`, `clear`, `photon`. If not specified, defaults to the
   distribution of the host.
 
 `--release=`, `-r`
@@ -477,6 +477,13 @@ details see the table below.
   Packages are appended to the list. Packages prefixed with "!" are
   removed from the list. "!*" removes all packages from the list.
 
+`--skip-final-phase=`
+
+: Causes the (second) final image build stage to be skipped. This is
+  useful in combination with a build script, for when you care about
+  the artifacts that were created locally in `$BUILDDIR`, but
+  ultimately plan to discard the final image.
+
 `--postinst-script=`
 
 : Takes a path to an executable that is invoked inside the final image
@@ -507,7 +514,9 @@ details see the table below.
   only those files `git-ls-files --cached` lists), `copy-git-others`
   (to copy only those files `git-ls-files --others` lists), `mount` to
   bind mount the source tree directly. Defaults to `copy-git-cached`
-  if a `git` source tree is detected, otherwise `copy-all`.
+  if a `git` source tree is detected, otherwise `copy-all`. When you
+  specify `copy-git-more`, it is the same as `copy-git-cached`, except
+  it also includes the `.git/` directory.
 
 `--with-network`
 
@@ -579,6 +588,12 @@ details see the table below.
 : Set the password of the `root` user. By default the `root` account
   is locked. If this option is not used but a file `mkosi.rootpw` exists
   in the local directory the root password is automatically read from it.
+
+`--password-is-hashed`
+
+: Indicate that the password supplied for the `root` user has already been
+  hashed, so that the string supplied with `--password` or `mkosi.rootpw` will
+  be written to `/etc/shadow` literally.
 
 `--extra-search-paths=`
 
@@ -668,6 +683,7 @@ which settings file options.
 | `--source-file-transfer=`    | `[Packages]`            | `SourceFileTransfer=`     |
 | `--build-directory=`         | `[Packages]`            | `BuildDirectory=`         |
 | `--build-packages=`          | `[Packages]`            | `BuildPackages=`          |
+| `--skip-final-phase=`        | `[Packages]`            | `SkipFinalPhase=`         |
 | `--postinst-script=`         | `[Packages]`            | `PostInstallationScript=` |
 | `--finalize-script=`         | `[Packages]`            | `FinalizeScript=`         |
 | `--with-network`             | `[Packages]`            | `WithNetwork=`            |
@@ -682,6 +698,7 @@ which settings file options.
 | `--key=`                     | `[Validation]`          | `Key=`                    |
 | `--bmap`                     | `[Validation]`          | `BMap=`                   |
 | `--password=`                | `[Validation]`          | `Password=`               |
+| `--password-is-hashed`       | `[Validation]`          | `PasswordIsHashed=`       |
 | `--extra-search-paths=`      | `[Host]`                | `ExtraSearchPaths=`       |
 
 Command line options that take no argument are not suffixed with a `=`
@@ -709,6 +726,8 @@ following *OS*es.
 * *CentOS*
 
 * *Clear Linux*
+
+* *Photon*
 
 In theory, any distribution may be used on the host for building
 images containing any other distribution, as long as the necessary
@@ -830,6 +849,9 @@ local directory:
   directory (see below), which is an easy way to exclude all build
   artifacts.
 
+  The `MKOSI_DEFAULT` environment variable will be set inside of this
+  script so that you know which `mkosi.default` (if any) was passed in.
+
 * `mkosi.postinst` may be an executable script. If it exists it is
   invoked as the penultimate step of preparing an image, from within
   the image context. It is once called for the *development* image (if
@@ -885,12 +907,13 @@ local directory:
   set, and it is up to build script to decide whether to do in in-tree
   or an out-of-tree build, and which build directory to use.
 
-* `mkosi.rootpw` may be a file containing the password for the root
-  user of the image to set. The password may optionally be followed by
-  a newline character which is implicitly removed. The file must have
-  an access mode of 0600 or less. If this file does not exist the
-  distribution's default root password is set (which usually means
-  access to the root user is blocked).
+* `mkosi.rootpw` may be a file containing the password or hashed
+  password (if `--password-is-hashed` is set) for the root user of the
+  image to set. The password may optionally be followed by a newline
+  character which is implicitly removed. The file must have an access
+  mode of 0600 or less. If this file does not exist the distribution's
+  default root password is set (which usually means access to the root
+  user is blocked).
 
 * `mkosi.passphrase` may be a passphrase file to use when LUKS
   encryption is selected. It should contain the passphrase literally,
