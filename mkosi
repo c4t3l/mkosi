@@ -488,8 +488,10 @@ def btrfs_subvol_make_ro(path: str, b: bool = True) -> None:
 def image_size(args: CommandLineArguments) -> int:
     size = GPT_HEADER_SIZE + GPT_FOOTER_SIZE
 
-    if args.root_size is not None:
-        size += args.root_size
+    if args.root_size_a is not None:
+        size += args.root_size_a
+    if args.root_size_b is not None:
+        size += args.root_size_b
     if args.home_size is not None:
         size += args.home_size
     if args.srv_size is not None:
@@ -515,6 +517,7 @@ def disable_cow(path: str) -> None:
     run(["chattr", "+C", path], stdout=DEVNULL, stderr=DEVNULL, check=False)
 
 
+##########import pudb; pudb.set_trace()#####################################################
 def determine_partition_table(args: CommandLineArguments) -> Tuple[str, bool]:
     pn = 1
     table = "label: gpt\n"
@@ -567,10 +570,19 @@ def determine_partition_table(args: CommandLineArguments) -> Tuple[str, bool]:
             run_sfdisk = True
 
     if args.output_format != OutputFormat.gpt_squashfs:
-        table += 'type={}, attrs={}, name="Root Partition"\n'.format(
+        table += 'type={}, attrs={}, name="Root Partition A"\n'.format(
             gpt_root_native(args.architecture).root,
             "GUID:60" if args.read_only and args.output_format != OutputFormat.gpt_btrfs else "")
         run_sfdisk = True
+        
+
+    args.root_partno = pn
+    pn += 1
+
+    if args.output_format != OutputFormat.gpt_squashfs:
+        table += 'type={}, attrs="GUID:63", name="Root Partition B"\n'.format(
+            gpt_root_native(args.architecture).root,
+            "GUID:60" if args.read_only and args.output_format != OutputFormat.gpt_btrfs else "")
 
     args.root_partno = pn
     pn += 1
@@ -580,6 +592,8 @@ def determine_partition_table(args: CommandLineArguments) -> Tuple[str, bool]:
         pn += 1
     else:
         args.verity_partno = None
+
+    print(f'Table is {table}...............END............\n\n\n\n\n\n')
 
     return table, run_sfdisk
 
@@ -2707,7 +2721,9 @@ def insert_squashfs(args: CommandLineArguments,
     assert squashfs is not None
 
     with complete_step('Inserting squashfs root partition'):
-        args.root_size = insert_partition(args, workspace, raw, loopdev, args.root_partno, squashfs,
+        args.root_size_a = insert_partition(args, workspace, raw, loopdev, args.root_partno, squashfs,
+                                          "Root Partition", gpt_root_native(args.architecture).root)
+        args.root_size_b = insert_partition(args, workspace, raw, loopdev, args.root_partno, squashfs,
                                           "Root Partition", gpt_root_native(args.architecture).root)
 
 
@@ -3412,8 +3428,10 @@ def create_parser() -> ArgumentParserMkosi:
     group.add_argument("--settings", dest='nspawn_settings', help='Add in .nspawn settings file', metavar='PATH')
 
     group = parser.add_argument_group("Partitions")
-    group.add_argument("--root-size",
-                       help='Set size of root partition (only gpt_ext4, gpt_xfs, gpt_btrfs)', metavar='BYTES')
+    group.add_argument("--root-size-a",
+                       help='Set size of root partition A (only gpt_ext4, gpt_xfs, gpt_btrfs)', metavar='BYTES')
+    group.add_argument("--root-size-b",
+                       help='Set size of root partition B (only gpt_ext4, gpt_xfs, gpt_btrfs)', metavar='BYTES')
     group.add_argument("--esp-size",
                        help='Set size of EFI system partition (only gpt_ext4, gpt_xfs, gpt_btrfs, gpt_squashfs)', metavar='BYTES')  # NOQA: E501
     group.add_argument("--xbootldr-size",
@@ -4043,7 +4061,8 @@ def load_args(args: CommandLineArguments) -> CommandLineArguments:
 
     if args.output_format.is_squashfs():
         args.read_only = True
-        args.root_size = None
+        args.root_size_a = None
+        args.root_size_b = None
         if args.compress is False:
             die('Cannot disable compression with squashfs')
         if args.compress is None:
@@ -4092,18 +4111,21 @@ def load_args(args: CommandLineArguments) -> CommandLineArguments:
         for i in range(len(args.skeleton_trees)):
             args.skeleton_trees[i] = os.path.abspath(args.skeleton_trees[i])
 
-    args.root_size = parse_bytes(args.root_size)
+    args.root_size_a = parse_bytes(args.root_size_a)
+    args.root_size_b = parse_bytes(args.root_size_b)
     args.home_size = parse_bytes(args.home_size)
     args.srv_size = parse_bytes(args.srv_size)
     args.esp_size = parse_bytes(args.esp_size)
     args.xbootldr_size = parse_bytes(args.xbootldr_size)
     args.swap_size = parse_bytes(args.swap_size)
 
-    if args.output_format in (OutputFormat.gpt_ext4, OutputFormat.gpt_btrfs) and args.root_size is None:
-        args.root_size = 1024*1024*1024
+    if args.output_format in (OutputFormat.gpt_ext4, OutputFormat.gpt_btrfs) and (args.root_size_a and args.root_size_b) is None:
+        args.root_size_a = 1024*1024*1024
+        args.root_size_b = 1024*1024*1024
 
-    if args.output_format == OutputFormat.gpt_xfs and args.root_size is None:
-        args.root_size = 1300*1024*1024
+    if args.output_format == OutputFormat.gpt_xfs and (args.root_size_a and args.root_size_b) is None:
+        args.root_size_a = 1300*1024*1024
+        args.root_size_b = 1300*1024*1024
 
     if args.bootable and args.esp_size is None:
         args.esp_size = 256*1024*1024
@@ -4273,7 +4295,8 @@ def print_summary(args: CommandLineArguments) -> None:
 
     if args.output_format.is_disk():
         sys.stderr.write("\nPARTITIONS:\n")
-        sys.stderr.write("        Root Partition: " + format_bytes_or_auto(args.root_size) + "\n")
+        sys.stderr.write("        Root Partition A: " + format_bytes_or_auto(args.root_size_a) + "\n")
+        sys.stderr.write("        Root Partition B: " + format_bytes_or_auto(args.root_size_b) + "\n")
         sys.stderr.write("        Swap Partition: " + format_bytes_or_disabled(args.swap_size) + "\n")
         if "uefi" in args.boot_protocols:
             sys.stderr.write("                   ESP: " + format_bytes_or_disabled(args.esp_size) + "\n")
