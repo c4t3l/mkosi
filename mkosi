@@ -2,6 +2,8 @@
 # PYTHON_ARGCOMPLETE_OK
 # SPDX-License-Identifier: LGPL-2.1+
 
+# TODO: Create optional "root" flag
+
 import argparse
 import collections
 import configparser
@@ -50,6 +52,7 @@ from typing import (
     cast,
 )
 
+#import pudb; pudb.set_trace()
 __version__ = '5'
 
 if sys.version_info < (3, 6):
@@ -491,7 +494,8 @@ def image_size(args: CommandLineArguments) -> int:
     if args.root_size_a is not None:
         size += args.root_size_a
     if args.root_size_b is not None:
-        size += args.root_size_b
+        #size += args.root_size_a
+        pass
     if args.home_size is not None:
         size += args.home_size
     if args.srv_size is not None:
@@ -517,7 +521,6 @@ def disable_cow(path: str) -> None:
     run(["chattr", "+C", path], stdout=DEVNULL, stderr=DEVNULL, check=False)
 
 
-##########import pudb; pudb.set_trace()#####################################################
 def determine_partition_table(args: CommandLineArguments) -> Tuple[str, bool]:
     pn = 1
     table = "label: gpt\n"
@@ -575,7 +578,6 @@ def determine_partition_table(args: CommandLineArguments) -> Tuple[str, bool]:
             "GUID:60" if args.read_only and args.output_format != OutputFormat.gpt_btrfs else "")
         run_sfdisk = True
         
-
     args.root_partno = pn
     pn += 1
 
@@ -584,7 +586,7 @@ def determine_partition_table(args: CommandLineArguments) -> Tuple[str, bool]:
             gpt_root_native(args.architecture).root,
             "GUID:60" if args.read_only and args.output_format != OutputFormat.gpt_btrfs else "")
 
-    args.root_partno = pn
+    args.root_b_partno = pn
     pn += 1
 
     if args.verity:
@@ -612,6 +614,8 @@ def create_image(args: CommandLineArguments, workspace: str, for_cache: bool) ->
         f.truncate(image_size(args))
 
         table, run_sfdisk = determine_partition_table(args)
+
+        print(f'Partition Data: \n {table}')
 
         if run_sfdisk:
             run(["sfdisk", "--color=never", f.name], input=table.encode("utf-8"), check=True)
